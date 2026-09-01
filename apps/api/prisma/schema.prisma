@@ -1,0 +1,189 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  MediStock — PostgreSQL schema (source of truth for durable state)
+//
+//  Redis holds a fast, mutable mirror of stock counters for the atomic hold
+//  path; PostgreSQL remains authoritative and is what every reconciliation job
+//  reads from.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PATIENT
+  PHARMACIST
+  ADMIN
+}
+
+enum PharmacyStatus {
+  PENDING
+  VERIFIED
+  SUSPENDED
+}
+
+enum ReservationStatus {
+  PENDING
+  CLAIMED
+  EXPIRED
+  CANCELLED
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String
+  fullName     String
+  phone        String?
+  role         Role      @default(PATIENT)
+
+  // Populated only for PHARMACIST accounts.
+  pharmacyId   String?   @db.Uuid
+  pharmacy     Pharmacy? @relation(fields: [pharmacyId], references: [id], onDelete: SetNull)
+
+  reservations Reservation[]
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([role])
+  @@index([pharmacyId])
+}
+
+model Pharmacy {
+  id        String         @id @default(uuid()) @db.Uuid
+  name      String
+  licenseNo String         @unique
+  status    PharmacyStatus @default(PENDING)
+
+  // Canonical coordinates. Verified pharmacies are additionally indexed in
+  // Redis via GEOADD for sub-millisecond proximity search.
+  latitude  Float
+  longitude Float
+  address   String
+  phone     String
+
+  staff       User[]
+  inventory   Inventory[]
+  reservations Reservation[]
+  syncBatches InventorySyncBatch[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([latitude, longitude])
+}
+
+model Medicine {
+  id             String  @id @default(uuid()) @db.Uuid
+  name           String
+  // Brand is part of the natural key; "" (empty) means unbranded / generic.
+  brand          String  @default("")
+  // Salt / composition used for substitution ("identical salt") searches.
+  genericFormula String
+  strength       String
+  form           String
+  isCritical     Boolean @default(false)
+
+  inventory    Inventory[]
+  reservations Reservation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([name, strength, form, brand])
+  @@index([genericFormula])
+  @@index([isCritical])
+}
+
+model Inventory {
+  id         String   @id @default(uuid()) @db.Uuid
+
+  pharmacyId String   @db.Uuid
+  pharmacy   Pharmacy @relation(fields: [pharmacyId], references: [id], onDelete: Cascade)
+
+  medicineId String   @db.Uuid
+  medicine   Medicine @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+
+  // Point-of-sale stock keeping unit as sent by the pharmacy's POS.
+  sku        String
+
+  // Physical shelf count.
+  totalStock Int      @default(0)
+  // Sum of quantities currently under an active PENDING reservation hold.
+  heldStock  Int      @default(0)
+
+  priceCents Int      @default(0)
+  currency   String   @default("USD")
+
+  // Optimistic-lock / change counter, bumped on every mutation. Lets the POS
+  // and reconciliation jobs detect drift cheaply.
+  version      Int      @default(0)
+  lastSyncedAt DateTime @default(now())
+
+  reservations Reservation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([pharmacyId, medicineId])
+  @@unique([pharmacyId, sku])
+  @@index([medicineId])
+  @@index([pharmacyId])
+}
+
+model Reservation {
+  id       String            @id @default(uuid()) @db.Uuid
+  // 6-digit OTP the patient presents at the counter.
+  code     String
+  status   ReservationStatus @default(PENDING)
+  quantity Int
+
+  patientId String @db.Uuid
+  patient   User   @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  pharmacyId String   @db.Uuid
+  pharmacy   Pharmacy @relation(fields: [pharmacyId], references: [id], onDelete: Cascade)
+
+  medicineId String   @db.Uuid
+  medicine   Medicine @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+
+  inventoryId String    @db.Uuid
+  inventory   Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+
+  // BullMQ job id for the delayed auto-reclamation job (== reservation id).
+  jobId      String?
+
+  expiresAt  DateTime
+  claimedAt  DateTime?
+  releasedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Primary hot path for the expiry sweep and for "my reservations".
+  @@index([status, expiresAt])
+  @@index([patientId])
+  @@index([pharmacyId, status])
+  @@index([inventoryId])
+  @@index([code])
+}
+
+/// Idempotency ledger for POS batch ingestion. A replayed `batchId` is a no-op,
+/// which lets pharmacies retry a failed sync without double-counting stock.
+model InventorySyncBatch {
+  id         String   @id @default(uuid()) @db.Uuid
+  batchId    String   @unique
+  pharmacyId String   @db.Uuid
+  pharmacy   Pharmacy @relation(fields: [pharmacyId], references: [id], onDelete: Cascade)
+  itemCount  Int
+  processedAt DateTime @default(now())
+
+  @@index([pharmacyId])
+}

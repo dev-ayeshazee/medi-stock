@@ -1,0 +1,107 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: medistock
+      POSTGRES_PASSWORD: medistock
+      POSTGRES_DB: medistock
+    ports:
+      # Host 5433 -> container 5432, to avoid clashing with a local Postgres on 5432.
+      # Containers still reach it as postgres:5432 on the compose network.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medistock -d medistock"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    ports:
+      # Host 6380 -> container 6379, to avoid clashing with a local Redis on 6379.
+      # Containers still reach it as redis://redis:6379 on the compose network.
+      - "6380:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: apply migrations + seed, then exit.
+  migrate:
+    build:
+      context: ./apps/api
+      target: build
+    # `migrate deploy` applies committed migrations if prisma/migrations exists;
+    # otherwise `db push` materialises the schema directly. Then seed.
+    command: sh -c "(npx prisma migrate deploy || npx prisma db push --skip-generate) && npx prisma db seed"
+    environment:
+      DATABASE_URL: postgresql://medistock:medistock@postgres:5432/medistock?schema=public
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./apps/api
+      target: runtime
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      DATABASE_URL: postgresql://medistock:medistock@postgres:5432/medistock?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: change-me-in-prod-please-a-long-random-string
+      RESERVATION_TTL_MINUTES: "30"
+      MAX_HOLD_QUANTITY: "5"
+      RUN_WORKER_IN_PROCESS: "false"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: ./apps/api
+      target: runtime
+    command: ["node", "dist/workers/expiry.worker.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://medistock:medistock@postgres:5432/medistock?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: change-me-in-prod-please-a-long-random-string
+      RESERVATION_TTL_MINUTES: "30"
+      EXPIRY_WORKER_CONCURRENCY: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: ./apps/web
+      target: runtime
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  redisdata:

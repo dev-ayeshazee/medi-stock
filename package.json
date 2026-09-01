@@ -1,0 +1,17 @@
+{
+  "name": "medistock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MediStock monorepo — Fastify API (apps/api) + React web client (apps/web)",
+  "scripts": {
+    "install:all": "npm --prefix apps/api install && npm --prefix apps/web install",
+    "dev:api": "npm --prefix apps/api run dev",
+    "dev:worker": "npm --prefix apps/api run dev:worker",
+    "dev:web": "npm --prefix apps/web run dev",
+    "build": "npm --prefix apps/api run build && npm --prefix apps/web run build",
+    "typecheck": "npm --prefix apps/api run typecheck && npm --prefix apps/web run typecheck",
+    "db:push": "npm --prefix apps/api run db:push",
+    "db:seed": "npm --prefix apps/api run db:seed",
+    "prisma:migrate": "npm --prefix apps/api run prisma:migrate"
+  }
+}
